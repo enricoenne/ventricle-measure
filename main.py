@@ -79,10 +79,10 @@ point_mask = point != 0
 point_coords = center_of_mass(point_mask)
 
 
-plt.imshow(distance)
-plt.scatter(ventr_coords[1], ventr_coords[0], color='#FF8800')
-plt.scatter(point_coords[1], point_coords[0], color='#008800')
-plt.show()
+# plt.imshow(distance)
+# plt.scatter(ventr_coords[1], ventr_coords[0], color='#FF8800')
+# plt.scatter(point_coords[1], point_coords[0], color='#008800')
+# plt.show()
 
 dx = point_coords[0] - ventr_coords[0]
 dy = point_coords[1] - ventr_coords[1]
@@ -113,7 +113,7 @@ for i in range(n_angles):
     cols = pixels[:,0]
     rows = pixels[:,1]
 
-    test_img[rows, cols] = 3000
+    test_img[rows, cols] = 2000
 
     current_thickness = np.max(distance[rows, cols])
 
@@ -121,7 +121,7 @@ for i in range(n_angles):
 
 # print(results)
 
-# plt.imshow(test_img)
-# plt.show()
+plt.imshow(test_img)
+plt.show()
 
 results.to_csv('result.csv')
