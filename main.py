@@ -44,6 +44,7 @@ def show_pic(pic, title = ''):
 
 
 donut, res = get_picture2D('donut.tif')
+point, _ = get_picture('point.tif')
 height, width = donut.shape
 print(width, height)
 
@@ -74,7 +75,7 @@ distance[donut_mask] = distance_transform_edt(~ventr_mask, sampling= res)[donut_
 ventr_coords = center_of_mass(ventr_mask)
 
 
-point, _ = get_picture('point.tif')
+
 point_mask = point != 0
 point_coords = center_of_mass(point_mask)
 
