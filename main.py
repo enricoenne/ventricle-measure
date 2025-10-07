@@ -148,7 +148,7 @@ for i in range(n_angles):
 
 
 
-    # add line on top of picture
+    # add radial picture line on top of picture
     # test_img[rows, cols] = max_dist
 
     # find the max ventricle distance along line
