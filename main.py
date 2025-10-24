@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from scipy.ndimage import distance_transform_edt, center_of_mass, label
+from scipy.signal import convolve2d
 from aicsimageio import AICSImage
 import matplotlib.pyplot as plt
 
@@ -56,8 +57,8 @@ def get_ray_pixels(matrix, center, angle, res):
 
     r = np.arange(0, max_length)
     # all points along the ray
-    x = ventr_coords[0] + r * np.cos(a)
-    y = ventr_coords[1] + r * np.sin(a)
+    x = center[0] + r * np.cos(angle)
+    y = center[1] + r * np.sin(angle)
     pixels = np.vstack((y.astype(int), x.astype(int))).T
 
     pixels = get_valid(pixels, *matrix.shape)
@@ -84,103 +85,262 @@ def get_line_pixels(p1, p2):
     rr, cc = line(y0, x0, y1, x1)  # note: line() expects (row, col)
     return rr, cc
 
-donut, res = get_picture2D('donut.tif')
-point, _ = get_picture('point.tif')
-height, width = donut.shape
-print(width, height)
 
-donut_mask = donut != 0
+'''
+this part is for weird shapes
+'''
+from scipy.ndimage import gaussian_filter
 
-# we should have only ventricle and outside regions
-labeled, n = label(~ donut_mask)
+def smoothing(pic, smoothing_factor = None):
+    area_pos = np.sum(pic == np.max(pic))
 
-if n != 2:
-    raise ValueError('problem with masks, too many regions')
+    if smoothing_factor is None:
+        smoothing_factor = area_pos**(1/2) / 50
+    print(f'smoothing factor = {smoothing_factor:.2f}')
 
-# outside label is the label of the pixel on the top left
-outside_label = labeled[(0,0)]
-outside_mask = labeled == outside_label
-# ventricle is the other region
-ventr_mask = (labeled != outside_label) & (~ donut_mask)
+    return gaussian_filter(pic, sigma=smoothing_factor, mode='constant', cval=0) > np.max(pic)/2
+
+def find_edge(outside_m):
+    kernel = np.array([
+        [0, 1, 0],
+        [1, 0, 1],
+        [0, 1, 0]
+    ])
+
+    neighbor_sum = convolve2d(outside_m, kernel, mode='same', boundary='fill', fillvalue=0)
+
+    edge = (outside_m == 0) & (neighbor_sum > 0)
+
+    return edge
+
+def follow_gradient(distance, start, mask_in, max_steps=1000):
+    """
+    Follow the distance gradient from start until reaching mask_in.
+    start: tuple (row, col)
+    mask_in: boolean array of internal edge
+    """
+
+    max_dist = 2 * np.max(distance)
+    dist_data = np.ma.filled(distance, max_dist)
 
 
-# show_pic(donut_mask, 'donut')
-
-# calculating distance from ventricle
-distance = np.zeros_like(donut, dtype=np.float64)
-# keeping it only in the area of the donut
-distance[donut_mask] = distance_transform_edt(~ventr_mask, sampling= res)[donut_mask]
-
-# max value in the distance pic
-max_dist = np.max(distance)
-
-
-# find center of the ventricle
-ventr_coords = center_of_mass(ventr_mask)
-
-
-# find point in the reference pic
-point_mask = point != 0
-point_coords = center_of_mass(point_mask)
-
-
-dx = point_coords[0] - ventr_coords[0]
-dy = point_coords[1] - ventr_coords[1]
-angle_0 = math.atan2(dy, dx)
-
-max_length = np.linalg.norm(donut.shape)
-# how many angles
-n_angles = 40
-
-results = pd.DataFrame(columns = ['angle_r', 'angle_d', 'thickness', 'ext_x', 'ext_y', 'vent_x', 'vent_y'])
-
-test_img = distance.copy()
-
-for i in range(n_angles):
-
-    # angle of the ray
-    a = 2*math.pi / n_angles * i + angle_0
+    gy, gx = np.gradient(dist_data)
     
-    line_pixels = get_ray_pixels(donut, point_coords, a, res)
+    # it could have non valid gradient due to the mask
+    pos = start.astype(float)
 
-    cols = line_pixels[:,0]
-    rows = line_pixels[:,1]
+    pos_list = []
+
+    for _ in range(max_steps):
+        r, c = int(round(pos[0])), int(round(pos[1]))
+        pos_list.append((r,c))
+        # plt.scatter(c, r, s=0.1, c="#ffe600")
+        if mask_in[r,c]:
+            # plt.show()
+            return (r, c), pos_list
+        
+        # Gradient at current position
+        dr, dc = gy[tuple([r,c])], gx[tuple([r,c])]
+
+        
+        # Move in direction of steepest descent
+        norm = np.hypot(dr, dc)
+        if norm == 0:
+            # plt.show()
+            return (r, c), pos_list
+        pos -= np.array([dr, dc]) / norm * 1  # small step can be scaled if needed
+
+    # plt.show()
+    return (r, c), pos_list
+
+
+def df_col_to_points(col):
+    coords = np.array(col)
+  
+    rows = coords[:, 0]
+    cols = coords[:, 1]
+
+    return cols, rows
+
+def thickening(pic, th = 5):
+    pic = pic.astype(bool)
+
+    dist_pic = distance_transform_edt(~pic)
+
+    return (dist_pic < th)
+
+def find_angle(p,q):
+
+    dx = p[0] - q[0]
+    dy = p[1] - q[1]
+    
+    return math.atan2(dy, dx)
+
+def ordered_edge_points(edge):
+    coords_in_np = np.argwhere(edge)
+
+
+    start_p = tuple(coords_in_np[0])
+    ordered_p = [start_p]
+
+    while len(ordered_p) < coords_in_np.shape[0]:
+
+        current_p = ordered_p[-1]
+
+        neighborhood = edge[current_p[0]-1:current_p[0]+2, current_p[1]-1:current_p[1]+2]
+        
+        # the set contains the considered point and the two 
+        neighbors = [tuple(int(c) for c in k) for k in np.argwhere(neighborhood)]
+
+        neighbors.remove((1,1))
+
+        # these are the only possible configurations for the first pixel
+        # ---    ---    ---
+        # -xx    -xx    -x-
+        # x--    -x-    x-x
+        # the only possible anticlockwise pixels are (2,0) or (2,1)
+        # 
+        if len(ordered_p) == 1:
+            if (2,0) in neighbors:
+                next_p = (2,0)
+            elif (2,1) in neighbors:
+                next_p = (2,1)
+            else:
+                raise ValueError('something wrong with the edge')
+            
+            # we need to convert the point coordinates back to the absolute reference
+            next_p = np.array([c-1 for c in next_p])
+            next_p = tuple(current_p + next_p)
+        else:
+            for p in neighbors:
+                # we need to convert the point coordinates back to the absolute reference
+                p = np.array([c-1 for c in p])
+                p = tuple(current_p + p)
+
+                if p not in ordered_p:
+                    next_p = p
+                    break
+            else:
+                raise ValueError('something wrong with the visited pixels')
+
+        ordered_p.append(next_p)
+    
+    return ordered_p
+
+def plot_ordered(order_var, y_var, df, name=None):
+    df_sorted = df.sort_values(by=order_var)
+
+    plt.title(order_var)
+    plt.plot(df_sorted[order_var], df_sorted[y_var])
+
+    if 'angle_mark' in df.columns:
+        angle_marks = df.loc[df_sorted.loc[df_sorted['angle_mark'] == 1].index, order_var]
+    elif 'quadrant' in df.columns:
+        angle_marks = df.loc[np.flatnonzero(np.diff(df_sorted['quadrant']) > 0), order_var]
+
+    plt.vlines(angle_marks, ymin=0, ymax=df[y_var].max()*1.1, linestyles='--', color='#aaaaaa')
+
+    if name is not None:
+        plt.savefig(f'plots/{name}_{y_var}-{order_var}.png')
+    plt.show()
+
+# donut, res = get_picture2D('donut.tif')
+# point, _ = get_picture('point.tif')
+# height, width = donut.shape
+# print(width, height)
+
+# donut_mask = donut != 0
+
+# # we should have only ventricle and outside regions
+# labeled, n = label(~ donut_mask)
+
+# if n != 2:
+#     raise ValueError('problem with masks, too many regions')
+
+# # outside label is the label of the pixel on the top left
+# outside_label = labeled[(0,0)]
+# outside_mask = labeled == outside_label
+# # ventricle is the other region
+# ventr_mask = (labeled != outside_label) & (~ donut_mask)
+
+
+# # show_pic(donut_mask, 'donut')
+
+# # calculating distance from ventricle
+# distance = np.zeros_like(donut, dtype=np.float64)
+# # keeping it only in the area of the donut
+# distance[donut_mask] = distance_transform_edt(~ventr_mask, sampling= res)[donut_mask]
+
+# # max value in the distance pic
+# max_dist = np.max(distance)
+
+
+# # find center of the ventricle
+# ventr_coords = center_of_mass(ventr_mask)
+
+
+# # find point in the reference pic
+# point_mask = point != 0
+# point_coords = center_of_mass(point_mask)
+
+
+# dx = point_coords[0] - ventr_coords[0]
+# dy = point_coords[1] - ventr_coords[1]
+# angle_0 = math.atan2(dy, dx)
+
+# max_length = np.linalg.norm(donut.shape)
+# # how many angles
+# n_angles = 40
+
+# results = pd.DataFrame(columns = ['angle_r', 'angle_d', 'thickness', 'ext_x', 'ext_y', 'vent_x', 'vent_y'])
+
+# test_img = distance.copy()
+
+# for i in range(n_angles):
+
+#     # angle of the ray
+#     a = 2*math.pi / n_angles * i + angle_0
+    
+#     line_pixels = get_ray_pixels(donut, point_coords, a, res)
+
+#     cols = line_pixels[:,0]
+#     rows = line_pixels[:,1]
 
 
 
-    # add radial picture line on top of picture
-    # test_img[rows, cols] = max_dist
+#     # add radial picture line on top of picture
+#     # test_img[rows, cols] = max_dist
 
-    # find the max ventricle distance along line
-    current_thickness = np.max(distance[rows, cols])
-    # where is the max distance along line
-    current_index = np.argmax(distance[rows, cols])
-    current_coords = [int(cols[current_index]), int(rows[current_index])]
+#     # find the max ventricle distance along line
+#     current_thickness = np.max(distance[rows, cols])
+#     # where is the max distance along line
+#     current_index = np.argmax(distance[rows, cols])
+#     current_coords = [int(cols[current_index]), int(rows[current_index])]
 
-    # circe centered in current point
-    circ_pixels = get_circle_pixels(distance, current_coords, current_thickness, res)
-    rows = circ_pixels[:,0]
-    cols = circ_pixels[:,1]
+#     # circe centered in current point
+#     circ_pixels = get_circle_pixels(distance, current_coords, current_thickness, res)
+#     rows = circ_pixels[:,0]
+#     cols = circ_pixels[:,1]
 
-    # add circle on top of picture
-    # test_img[rows, cols] = max_dist
+#     # add circle on top of picture
+#     # test_img[rows, cols] = max_dist
 
-    # I need to set the pixels outside the tissue at some max value
-    fake_distance = distance.copy()
-    fake_distance[outside_mask] = max_dist
-    vent_index = np.argmin(fake_distance[rows, cols])
-    vent_coords = [int(cols[vent_index]), int(rows[vent_index])]
+#     # I need to set the pixels outside the tissue at some max value
+#     fake_distance = distance.copy()
+#     fake_distance[outside_mask] = max_dist
+#     vent_index = np.argmin(fake_distance[rows, cols])
+#     vent_coords = [int(cols[vent_index]), int(rows[vent_index])]
 
-    r_line, c_line = get_line_pixels(current_coords, vent_coords)
-    test_img[r_line, c_line] = max_dist
+#     r_line, c_line = get_line_pixels(current_coords, vent_coords)
+#     test_img[r_line, c_line] = max_dist
 
-    results.loc[len(results)] = [a-angle_0, np.degrees(a-angle_0), current_thickness, *current_coords, *vent_coords]
+#     results.loc[len(results)] = [a-angle_0, np.degrees(a-angle_0), current_thickness, *current_coords, *vent_coords]
 
-# print(results)
+# # print(results)
 
-plt.imshow(test_img, cmap = 'magma')
-plt.scatter(results['ext_x'], results['ext_y'], s = 10, color = 'cyan')
-plt.scatter(results['vent_x'], results['vent_y'], s = 10, color = 'cyan')
-plt.show()
+# plt.imshow(test_img, cmap = 'magma')
+# plt.scatter(results['ext_x'], results['ext_y'], s = 10, color = 'cyan')
+# plt.scatter(results['vent_x'], results['vent_y'], s = 10, color = 'cyan')
+# plt.show()
 
-results.to_csv('result.csv')
+# results.to_csv('result.csv')
