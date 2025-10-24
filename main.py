@@ -131,6 +131,7 @@ def follow_gradient(distance, start, mask_in, max_steps=1000):
 
     pos_list = []
 
+
     for _ in range(max_steps):
         r, c = int(round(pos[0])), int(round(pos[1]))
         pos_list.append((r,c))
@@ -243,6 +244,102 @@ def plot_ordered(order_var, y_var, df, name=None):
     if name is not None:
         plt.savefig(f'plots/{name}_{y_var}-{order_var}.png')
     plt.show()
+
+def find_closest(p, edge, res=(1,1)):
+    blank = np.zeros_like(edge)
+    blank[p] = 1
+
+    d = distance_transform_edt(~blank, sampling=res)
+    d = np.ma.masked_array(d, ~edge)
+
+    output_coords = tuple(int(c) for c in np.unravel_index(np.argmin(d), edge.shape))
+    dist = float(d[output_coords])
+
+    return output_coords, dist
+
+def follow_gradient_quantification(distance, start, edge_in, edge_out, res = (1,1), max_steps=1000, show = False):
+    """
+    Follow the distance gradient from start until reaching mask_in.
+    start: tuple (row, col)
+    mask_in: boolean array of internal edge
+    """
+
+    flag_in = edge_in[start[0], start[1]]
+    flag_out = edge_out[start[0], start[1]]
+
+    if flag_in:
+        distance = -distance
+        target_edge = edge_out
+    elif flag_out:
+        target_edge = edge_in
+    else:
+        target_edge = edge_in
+    
+
+    max_dist = 2 * np.max(distance)
+    dist_data = np.ma.filled(distance, max_dist)
+
+    gy, gx = np.gradient(dist_data)
+    
+
+    # it could have non valid gradient due to the mask
+    pos = start.astype(float)
+
+    length = 0
+    pos_list = []
+
+    if show:
+        plt.imshow(distance)
+        plt.xlim(start[1]-200,start[1]+200)
+        plt.ylim(start[0]-200,start[0]+200)
+    
+    prev_move = np.zeros(2)
+    alpha = 0.6
+
+    for _ in range(max_steps):
+        r, c = int(round(pos[0])), int(round(pos[1]))
+        pos_list.append((r,c))
+        if show:
+            plt.scatter(c, r, s=0.1, c="#ff00c8")
+        # condition to return if we reach the opposite edge
+        if target_edge[r,c] == 1:
+            if show:
+                plt.show()
+            
+            return length, (r, c), pos_list
+        
+        # gradient at current position
+        dr, dc = gy[tuple([r,c])], gx[tuple([r,c])]
+
+        
+        # Move in direction of steepest descent
+        norm = np.hypot(dr * res[0], dc * res[1])
+        if norm == 0:
+            # I DONT KNOW WHAT IS THE PROBLEM, WHY IS IT STOPPING
+
+            # print((r,c))
+            # sometimes it might get stuck in points that don't belong to the edge
+            proper_coord, dist_from_target = find_closest((r, c), target_edge, res=res)
+
+            # for some readon adding this distance causes a lot of problems
+            # length += dist_from_target
+
+            if show:
+                plt.show()
+            return length, proper_coord, pos_list
+        
+        movement = np.array([dr, dc]) / (norm + 1e-8)
+        movement = alpha * prev_move + (1 - alpha) * movement
+        pos -= movement
+        prev_move = movement
+
+        length += np.hypot(res[0], res[1])
+
+
+    proper_coord, dist_from_target = find_closest((r, c), target_edge, res=res)
+    if show:
+        plt.show()
+    return length, (r, c), pos_list
 
 # donut, res = get_picture2D('donut.tif')
 # point, _ = get_picture('point.tif')
