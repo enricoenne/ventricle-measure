@@ -10,6 +10,9 @@ from skimage.draw import line
 
 import math
 
+from scipy.spatial import ConvexHull
+from matplotlib.path import Path
+
 def get_picture(path):
     '''
     reading picture and metadata
@@ -340,6 +343,76 @@ def follow_gradient_quantification(distance, start, edge_in, edge_out, res = (1,
     if show:
         plt.show()
     return length, (r, c), pos_list
+
+
+# GYRIFICATION
+
+def get_edge_coords(shape):
+    edge = ordered_edge_points(find_edge(shape))
+    edge = np.array(edge)
+
+    xs = edge[:,0]
+    ys = edge[:,1]
+
+    return xs, ys
+
+def dist(p0, p1, res=(1,1)):
+    return np.hypot((p1[0]-p0[0])*res[0],
+                    (p1[1]-p0[1])*res[1])
+
+def len_edge(shape, res=(1,1), loop=True):
+    edge = find_edge(shape)
+
+    edge = ordered_edge_points(edge)
+
+    l = 0
+
+    for i, p in enumerate(edge):
+        if i==0:
+            if loop:
+                l_step = dist(p, edge[-1], res=res)
+            else:
+                l_step = 0
+        else:
+            l_step = dist(p, edge[i-1], res=res)
+
+        l += l_step
+
+    return float(l)
+
+def gyr_index(donut, res=(1,1)):
+    donut = np.pad(donut, pad_width=10, mode='constant', constant_values=0)
+
+    donut_mask = donut != 0
+
+    # we should have only ventricle and outside regions
+    labeled, n = label(~ donut_mask)
+
+    if n != 2:
+        raise ValueError('problem with masks, too many regions')
+
+    # outside label is the label of the pixel on the top left
+    outside_label = labeled[(0,0)]
+    outside_mask = labeled == outside_label
+
+    tissue = ~outside_mask
+
+    points = np.column_stack(np.nonzero(tissue))
+
+    hull = ConvexHull(points)
+    hull_coords = points[hull.vertices]
+
+    yy, xx = np.mgrid[0:tissue.shape[0], 0:tissue.shape[1]]
+    coords = np.column_stack((yy.ravel(), xx.ravel()))
+
+    path = Path(hull_coords)
+    inside = path.contains_points(coords)
+    hull_mask = inside.reshape(tissue.shape)
+
+    len_surf = len_edge(tissue, res=res)
+    len_hull = len_edge(hull_mask, res=res)
+
+    return len_surf/len_hull, len_surf, len_hull
 
 # donut, res = get_picture2D('donut.tif')
 # point, _ = get_picture('point.tif')
