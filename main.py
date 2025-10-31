@@ -8,10 +8,19 @@ import matplotlib.pyplot as plt
 
 from skimage.draw import line
 
+import skfmm
+
 import math
 
 from scipy.spatial import ConvexHull
 from matplotlib.path import Path
+
+from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import median_filter
+
+
+from tqdm import tqdm
 
 def get_picture(path):
     '''
@@ -94,11 +103,11 @@ this part is for weird shapes
 '''
 from scipy.ndimage import gaussian_filter
 
-def smoothing(pic, smoothing_factor = None):
+def smoothing(pic, smoothing_factor = None, smoothing_scale = 50):
     area_pos = np.sum(pic == np.max(pic))
 
     if smoothing_factor is None:
-        smoothing_factor = area_pos**(1/2) / 50
+        smoothing_factor = area_pos**(1/2) / smoothing_scale
     print(f'smoothing factor = {smoothing_factor:.2f}')
 
     return gaussian_filter(pic, sigma=smoothing_factor, mode='constant', cval=0) > np.max(pic)/2
@@ -297,7 +306,7 @@ def follow_gradient_quantification(distance, start, edge_in, edge_out, res = (1,
         plt.ylim(start[0]-200,start[0]+200)
     
     prev_move = np.zeros(2)
-    alpha = 0.6
+    alpha = 0.75
 
     for _ in range(max_steps):
         r, c = int(round(pos[0])), int(round(pos[1]))
@@ -383,6 +392,8 @@ def len_edge(shape, res=(1,1), loop=True):
 def gyr_index(donut, res=(1,1)):
     donut = np.pad(donut, pad_width=10, mode='constant', constant_values=0)
 
+    donut = smoothing(donut, 10)
+
     donut_mask = donut != 0
 
     # we should have only ventricle and outside regions
@@ -413,6 +424,215 @@ def gyr_index(donut, res=(1,1)):
     len_hull = len_edge(hull_mask, res=res)
 
     return len_surf/len_hull, len_surf, len_hull
+
+def thick_analysis(donut, points, res):
+    donut = np.pad(donut, pad_width=5, mode='constant', constant_values=0)
+    ref_points = np.pad(points, pad_width=5, mode='constant', constant_values=0)
+
+    donut = smoothing(donut, smoothing_scale=50)
+    # donut = median_filter(donut, size=5, mode='reflect')
+
+
+    donut_mask = donut != 0
+
+    # we should have only ventricle and outside regions
+    labeled, n = label(~ donut_mask)
+
+    if n != 2:
+        raise ValueError('problem with masks, too many regions')
+
+    # outside label is the label of the pixel on the top left
+    outside_label = labeled[(0,0)]
+    outside_mask = labeled == outside_label
+    # ventricle is the other region
+    ventr_mask = (labeled != outside_label) & (~ donut_mask)
+
+
+    edge_in = find_edge(ventr_mask)
+    edge_out = find_edge(outside_mask)
+
+    tissue = np.ma.MaskedArray(~edge_in, ~donut)
+    distance_from_in = skfmm.distance(tissue, dx=res)
+
+    tissue = np.ma.MaskedArray(~edge_out, ~donut)
+    distance_from_out = skfmm.distance(tissue, dx=res)
+
+    distance_from_out = distance_from_out / distance_from_out.max()
+    distance_from_in = distance_from_in / distance_from_in.max()
+
+    k = 10
+    magic_dist =  distance_from_in*(1 / (k + distance_from_in)) - distance_from_out*(1 / (k + distance_from_out))
+
+    # dataframe of internal points
+    in_df = pd.DataFrame()
+
+    coords_in_np = np.argwhere(edge_in)
+    coords_in = [tuple(map(int,c)) for c in coords_in_np]
+
+    in_df['p_in'] = coords_in
+
+    # datagrame of external points
+    out_df = pd.DataFrame()
+
+    coords_out_np = np.argwhere(edge_out)
+    coords_out = [tuple(map(int,c)) for c in coords_out_np]
+
+    out_df['p_out'] = coords_out
+
+
+    reference_in_list = []
+
+    for i, p in enumerate(tqdm(coords_in)):
+        p_np = np.array(p)
+        l, target, _ = follow_gradient_quantification(magic_dist, p_np, edge_in, edge_out)
+
+        in_df.loc[i, 'dist'] = l
+        reference_in_list.append(target)
+
+    in_df['p_out'] = reference_in_list
+
+
+
+    reference_out_list = []
+
+    for i, p in enumerate(tqdm(coords_out)):
+        p_np = np.array(p)
+        l, target, _ = follow_gradient_quantification(magic_dist, p_np, edge_in, edge_out)
+
+        out_df.loc[i, 'dist'] = l
+        reference_out_list.append(target)
+
+    out_df['p_in'] = reference_out_list
+
+
+    # dealing with 4 ref points
+    marks_df = pd.DataFrame()
+    labeled_mark, n_mark = label(ref_points)
+
+    # print(labeled_mark.shape)
+
+    mark_coords = []
+    mark_sizes = []
+
+    for l in range(1, n_mark+1):
+        current_mark = labeled_mark == l
+        current_center = center_of_mass(current_mark)
+        mark_coords.append(tuple(float(c) for c in current_center))
+
+        mark_sizes.append(np.sum(current_mark))
+
+    marks_df['label'] = range(1, n_mark+1)
+    marks_df['coords'] = mark_coords
+    marks_df['size'] = mark_sizes
+
+    marks_df
+
+    in_df['quadrant'] = 0
+    for i in range(n_mark):
+        current_mark = marks_df['coords'][i]
+        current_lab = marks_df['label'][i]
+
+        point_dist = distance_transform_edt(labeled_mark != current_lab)
+        # we fill with the max dist value
+        base = np.ones_like(labeled_mark, dtype = float) * np.max(point_dist)
+        # we put the actual dist values only on the edge_in
+        base[edge_in.astype(bool)] = point_dist[edge_in.astype(bool)]
+        # coord of the minimum
+        current_in_coords = tuple(int(c) for c in np.unravel_index(np.argmin(base), base.shape))
+
+        in_df.loc[in_df['p_in'] == current_in_coords, 'quadrant'] = 1
+        # if the point is the biggest, it means it's the medial
+        if marks_df['size'][i] == marks_df['size'].max():
+            starting_in = current_in_coords
+
+    # order on ventricle perimeter
+    ordered_edge_in = ordered_edge_points(edge_in)
+    i = ordered_edge_in.index(starting_in)
+    ordered_edge_in = ordered_edge_in[i:] + ordered_edge_in[:i]
+    order_map = {p: i for i, p in enumerate(ordered_edge_in)}
+    in_df['order_in'] = in_df['p_in'].map(order_map)
+    in_df = in_df.sort_values(by='order_in', ignore_index=True)
+    in_df['quadrant'] = np.cumsum(in_df['quadrant'])
+    # in_df['order_in_norm'] = in_df['order_in']/in_df['order_in'].max()
+
+    in_df = in_df.sort_values(by='order_in')
+
+
+
+    starting_point_out = in_df.loc[in_df['order_in'] == 0, 'p_out'].values[0]
+    ordered_edge_out = ordered_edge_points(edge_out)
+
+    i_out = ordered_edge_out.index(starting_point_out)
+    ordered_edge_out = ordered_edge_out[i_out:] + ordered_edge_out[:i_out]
+
+    order_map = {p: i for i, p in enumerate(ordered_edge_out)}
+    out_df['order_out'] = out_df['p_out'].map(order_map)
+
+    out_df = out_df.sort_values(by='order_out')
+
+
+    res_in_df = out_df.merge(in_df[['p_in', 'p_out', 'order_in', 'dist', 'quadrant']],
+                      on='p_in',
+                      how = 'outer')
+    res_in_df = res_in_df.sort_values(by = 'order_in').reset_index(drop=True)
+
+    res_out_df = out_df.merge(in_df[['p_out', 'p_in', 'order_in', 'dist', 'quadrant']],
+                      on='p_out',
+                      how = 'outer')
+    res_out_df = res_out_df.sort_values(by = 'order_out').reset_index(drop=True)    
+
+    res_in_df['norm'] = np.linspace(0, 1, len(res_in_df))
+    res_out_df['norm'] = np.linspace(0, 1, len(res_out_df))
+
+    x_in, y_in = res_in_df['norm'].values, gaussian_filter1d(res_in_df['dist_y'], sigma=5)
+    x_out, y_out = res_out_df['norm'].values, gaussian_filter1d(res_out_df['dist_x'], sigma=5)
+
+    x_common = np.linspace(0, 1, 1000)
+
+    y_in_interp = np.interp(x_common, x_in, y_in)
+    y_out_interp = np.interp(x_common, x_out, y_out)
+
+
+    y_merge = np.maximum(y_in_interp, y_out_interp)
+    y_smooth = gaussian_filter1d(y_merge, sigma=5)
+
+    output_quadrant = []
+    output_p_in = []
+    output_p_out = []
+
+    quad_df = pd.concat([res_in_df[['norm', 'quadrant']], res_out_df[['norm', 'quadrant']]], ignore_index=True).dropna(subset='quadrant')
+
+    for k in x_common:
+
+        # find index of closest value
+        idx_in  = (np.abs(res_in_df['norm'] - k)).idxmin()
+        idx_out = (np.abs(res_out_df['norm'] - k)).idxmin()
+
+        current_in_row  = res_in_df.loc[idx_in]
+        current_out_row = res_out_df.loc[idx_out]
+
+
+        idx  = (np.abs(quad_df['norm'] - k)).idxmin()
+        current_quad = quad_df.loc[idx, 'quadrant']
+        # print('quad - ', current_quad)
+
+        output_quadrant.append(round(current_quad))
+
+        output_p_in.append(current_in_row['p_in'])
+        output_p_out.append(current_out_row['p_out'])
+
+    output_quadrant = np.array(output_quadrant)
+    output_quadrant = median_filter(output_quadrant, size = 11)
+
+    output_df = pd.DataFrame()
+    output_df['norm'] = x_common
+    output_df['dist'] = y_smooth
+    output_df['quadrant'] = output_quadrant
+    output_df['p_in'] = output_p_in
+    output_df['p_out'] = output_p_out
+
+
+    return output_df, donut
 
 # donut, res = get_picture2D('donut.tif')
 # point, _ = get_picture('point.tif')
